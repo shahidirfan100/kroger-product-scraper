@@ -1,0 +1,41 @@
+{
+    "actorSpecification": 1,
+    "views": {
+        "overview": {
+            "title": "Kroger products",
+            "transformation": {
+                "fields": [
+                    "name",
+                    "brand",
+                    "size",
+                    "regular_price",
+                    "sale_price",
+                    "availability",
+                    "stock_level",
+                    "rating",
+                    "reviews_count",
+                    "image_url",
+                    "product_url",
+                    "location_id"
+                ]
+            },
+            "display": {
+                "component": "table",
+                "properties": {
+                    "name": { "label": "Product", "format": "text" },
+                    "brand": { "label": "Brand", "format": "text" },
+                    "size": { "label": "Size", "format": "text" },
+                    "regular_price": { "label": "Regular price", "format": "number" },
+                    "sale_price": { "label": "Sale price", "format": "number" },
+                    "availability": { "label": "Availability", "format": "text" },
+                    "stock_level": { "label": "Stock", "format": "text" },
+                    "rating": { "label": "Rating", "format": "number" },
+                    "reviews_count": { "label": "Reviews", "format": "number" },
+                    "image_url": { "label": "Image", "format": "image" },
+                    "product_url": { "label": "Product URL", "format": "link" },
+                    "location_id": { "label": "Location", "format": "text" }
+                }
+            }
+        }
+    }
+}

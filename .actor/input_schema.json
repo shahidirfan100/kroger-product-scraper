@@ -1,0 +1,68 @@
+{
+    "title": "Kroger Product Scraper",
+    "description": "Extract structured Kroger product data from a search URL or keyword, including prices, availability, ratings, images, nutrition, and aisle information.",
+    "type": "object",
+    "schemaVersion": 1,
+    "properties": {
+        "startUrl": {
+            "title": "Kroger search or product URL",
+            "type": "string",
+            "description": "Optional Kroger search URL or product URL. When supplied, its query parameters are used. Use keyword when no URL is supplied.",
+            "editor": "textfield",
+            "prefill": "https://www.kroger.com/search?query=cream&searchType=default_search"
+        },
+        "keyword": {
+            "title": "Keyword",
+            "type": "string",
+            "description": "Search term used when a URL is not supplied, for example cream, milk, or cereal.",
+            "editor": "textfield",
+            "prefill": "cream"
+        },
+        "sortBy": {
+            "title": "Sort products",
+            "type": "string",
+            "description": "Product ordering for keyword searches.",
+            "editor": "select",
+            "enum": ["relevance", "popularity", "price_low_to_high", "price_high_to_low", "alphabetical"],
+            "enumTitles": [
+                "Best match",
+                "Most popular",
+                "Price: low to high",
+                "Price: high to low",
+                "Alphabetical: A-Z"
+            ],
+            "default": "relevance",
+            "prefill": "relevance"
+        },
+        "results_wanted": {
+            "title": "Results wanted",
+            "type": "integer",
+            "description": "Maximum number of products to save.",
+            "minimum": 1,
+            "default": 20,
+            "prefill": 20,
+            "editor": "number"
+        },
+        "max_pages": {
+            "title": "Maximum search pages",
+            "type": "integer",
+            "description": "Maximum number of 24-product search pages to request.",
+            "minimum": 1,
+            "default": 3,
+            "prefill": 3,
+            "editor": "number"
+        },
+        "proxyConfiguration": {
+            "title": "Proxy configuration",
+            "type": "object",
+            "description": "Optional Apify Proxy configuration for requests to Kroger.",
+            "editor": "proxy",
+            "default": {
+                "useApifyProxy": true,
+                "apifyProxyGroups": ["RESIDENTIAL"]
+            }
+        }
+    },
+    "required": [],
+    "additionalProperties": false
+}
