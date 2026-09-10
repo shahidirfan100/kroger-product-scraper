@@ -1,41 +1,36 @@
-## Selected API
+# Kroger listing API validation
 
-- Search endpoint: `GET https://www.kroger.com/atlas/v1/search/v1/products-search`
-- Product endpoint: `GET https://www.kroger.com/atlas/v1/product/v2/products`
-- Authentication: No OAuth token was required for the browser-backed public web requests.
-- Required request context: `x-kroger-channel: WEB`, a valid `x-laf-object` JSON header, and a Kroger referer.
-- Search pagination: `page.offset` and `page.size`; the live site uses a page size of 24.
-- Search sorting: `sortCriteria=relevance|popularity|price|description` and `sortOrder=asc|desc`.
-- Product pagination: UPC batches through repeated `filter.gtin13s` parameters. The actor batches at 20 UPCs per detail request.
-- Rich fields available: product identity, brand, size, categories, department tree, descriptions, ingredients, allergens, nutrition facts, images, prices, sale prices, unit prices, inventory, fulfillment options, ratings, reviews count, aisle data, product URLs, and search ranking metadata.
+## Selected source
 
-## API discovery notes
+- **Endpoint:** `GET https://www.kroger.com/atlas/v1/search/v1/products-search`
+- **Authentication:** No OAuth token was required in the browser session.
+- **Required request context:** `x-kroger-channel: WEB`, a valid `x-laf-object` JSON header, an `Accept: application/json` header, and a Kroger search-page referer.
+- **Pagination:** `page.offset` and `page.size`; the live page requests 24 records at a time.
+- **Sorting:** `sortCriteria=relevance|popularity|price|description` with `sortOrder=asc|desc`.
+- **Location context:** The actor uses location `02100537`, facility `4000`, the published assortment key, and `IN_STORE`, `PICKUP`, and `DELIVERY` fulfillment filters.
 
-The supplied Kroger search page was opened and its network traffic was inspected. The page returned a JSON search response containing `data.productsSearch` and `meta.productsSearch.totalCount`. The next JSON request returned full product records using the UPCs from the search response. No page HTML or rendered product cards are used by the actor.
+The listing response contains `data.productsSearch` and `meta.productsSearch`. Each listing record provides the product UPC, description, brand name, search rank, relevance score, grouping, sub-commodity codes, personalization state, and optional sponsored placement data. The response also provides `totalCount`, page offsets, page size, and `hasMore` information.
 
-The live web bundle defines these sort values:
-
-| UI option          | `sortCriteria` | `sortOrder` |
-| ------------------ | -------------- | ----------- |
-| Best Match         | `relevance`    | `desc`      |
-| Most Popular       | `popularity`   | `desc`      |
-| Price: Low to High | `price`        | `asc`       |
-| Price: High to Low | `price`        | `desc`      |
-| Alphabetical: A-Z  | `description`  | `asc`       |
+A live browser validation on 2026-09-10 returned HTTP 200 for both a normal keyword (`perfume`) and a UPC query (`0001111046235`). The UPC query returned the matching product through the listing endpoint, so direct product URL inputs can use the same listing path without opening the product-detail API or product page.
 
 ## Candidate matrix
 
-| Candidate                       | Status                                                                   | Fields                          | Pagination                    | Decision                                                                    |
-| ------------------------------- | ------------------------------------------------------------------------ | ------------------------------- | ----------------------------- | --------------------------------------------------------------------------- |
-| URLScan search for `kroger.com` | Existing public scans found, but result payload access returned HTTP 403 | Not available                   | Not inspected                 | Not selected because the live browser provided a better direct confirmation |
-| Desktop Kroger web JSON request | HTTP 200                                                                 | 20+ product and metadata groups | `page.offset` and `page.size` | Selected                                                                    |
-| iOS Safari bootstrap/API probe  | Not needed after the desktop JSON source was confirmed                   | Not needed                      | Not needed                    | Not selected                                                                |
-| Android app-style API probe     | Not needed after the desktop JSON source was confirmed                   | Not needed                      | Not needed                    | Not selected                                                                |
-| Kroger HTML page                | HTTP page rendered, but not used for extraction                          | Product cards only              | UI loading                    | Rejected in favor of JSON                                                   |
-| Browser automation fallback     | Used only during discovery to observe XHR/fetch traffic                  | Same JSON responses             | Same API pagination           | Not used by the actor                                                       |
+| Candidate | Validation | Decision |
+| --- | --- | --- |
+| Listing search endpoint | Browser request returned HTTP 200, expected `data.productsSearch`, and pagination metadata | **Selected** |
+| Product-detail endpoint | Not required for the requested output; adds a blocked request after listing and was the failure-prone step | Rejected |
+| Direct Impit request | Fast path, but Kroger can return HTTP 403/429 or reset the connection | Kept as first attempt only |
+| Browser-context listing fetch | A real Chrome page completes the edge challenge, then same-origin `fetch()` returns the listing JSON | **Fallback selected** |
+| HTML product cards | Rendered successfully but are not required when listing JSON is available | Rejected |
+| URLScan and guessed mobile/app endpoints | No stronger source was needed after live listing validation | Not selected |
 
-## Replay requirements
+## Runtime strategy
 
-The search and product requests require a location-assortment context. The actor uses the internal default location `02100537` and builds the matching LAF header for every run. Store selection and custom LAF overrides are intentionally not exposed as actor inputs.
+1. Open one persistent Patchright Chrome session on the **search page** before making the first listing request. The actor waits for the page/challenge to settle, but does not require Kroger's own listing XHR to be captured.
+2. Fetch the listing endpoint from that same browser page with the required LAF and channel headers.
+3. If the browser session cannot obtain JSON after bounded retries, try the configured Apify Residential proxy with Impit, then direct Impit when a proxy was configured.
+4. Map and save listing records immediately. Search runs never call `/atlas/v1/product/v2/products`.
+5. Preserve the complete raw listing record in `listing_data` and bounded pagination/search metadata in `listing_metadata`.
+6. Close the browser session in `finally`, while preserving the original actor error for Apify.
 
-The selected requests were replayed in the browser with the exact LAF object shape and returned HTTP 200 JSON. The actor uses `impit` with one shared Chrome client, keeps the API request context consistent, retries 403/429/5xx responses, and pushes each completed product batch immediately.
+The actor does not log cookies, tokens, proxy credentials, or full response bodies. Empty or malformed listing responses remain fatal because they cannot produce trustworthy product records; a blocked detail request can no longer fail a search run because no detail request is made.

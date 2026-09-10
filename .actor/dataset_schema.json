@@ -7,15 +7,11 @@
                 "fields": [
                     "name",
                     "brand",
-                    "size",
-                    "regular_price",
-                    "sale_price",
-                    "availability",
-                    "stock_level",
-                    "rating",
-                    "reviews_count",
-                    "image_url",
-                    "product_url",
+                    "upc",
+                    "search_rank",
+                    "relevance_score",
+                    "sponsored",
+                    "group_id",
                     "location_id"
                 ]
             },
@@ -24,15 +20,11 @@
                 "properties": {
                     "name": { "label": "Product", "format": "text" },
                     "brand": { "label": "Brand", "format": "text" },
-                    "size": { "label": "Size", "format": "text" },
-                    "regular_price": { "label": "Regular price", "format": "number" },
-                    "sale_price": { "label": "Sale price", "format": "number" },
-                    "availability": { "label": "Availability", "format": "text" },
-                    "stock_level": { "label": "Stock", "format": "text" },
-                    "rating": { "label": "Rating", "format": "number" },
-                    "reviews_count": { "label": "Reviews", "format": "number" },
-                    "image_url": { "label": "Image", "format": "image" },
-                    "product_url": { "label": "Product URL", "format": "link" },
+                    "upc": { "label": "UPC", "format": "text" },
+                    "search_rank": { "label": "Search rank", "format": "number" },
+                    "relevance_score": { "label": "Relevance", "format": "number" },
+                    "sponsored": { "label": "Sponsored", "format": "boolean" },
+                    "group_id": { "label": "Group", "format": "text" },
                     "location_id": { "label": "Location", "format": "text" }
                 }
             }

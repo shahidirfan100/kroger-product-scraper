@@ -1,6 +1,5 @@
 {
     "startUrl": "https://www.kroger.com/search?query=cream&searchType=default_search",
-    "keyword": "cream",
     "sortBy": "relevance",
     "results_wanted": 20,
     "max_pages": 3,

@@ -15,8 +15,7 @@
             "title": "Keyword",
             "type": "string",
             "description": "Search term used when a URL is not supplied, for example cream, milk, or cereal.",
-            "editor": "textfield",
-            "prefill": "cream"
+            "editor": "textfield"
         },
         "sortBy": {
             "title": "Sort products",
