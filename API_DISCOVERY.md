@@ -1,36 +1,74 @@
-# Kroger listing API validation
+# Kroger product source validation
 
-## Selected source
+## Selected sources
 
-- **Endpoint:** `GET https://www.kroger.com/atlas/v1/search/v1/products-search`
-- **Authentication:** No OAuth token was required in the browser session.
-- **Required request context:** `x-kroger-channel: WEB`, a valid `x-laf-object` JSON header, an `Accept: application/json` header, and a Kroger search-page referer.
-- **Pagination:** `page.offset` and `page.size`; the live page requests 24 records at a time.
-- **Sorting:** `sortCriteria=relevance|popularity|price|description` with `sortOrder=asc|desc`.
-- **Location context:** The actor uses location `02100537`, facility `4000`, the published assortment key, and `IN_STORE`, `PICKUP`, and `DELIVERY` fulfillment filters.
+1. **Search listing (paginated)** - `GET https://www.kroger.com/atlas/v1/search/v1/products-search`
+2. **Product details (batched)** - `GET https://www.kroger.com/atlas/v1/product/v2/products`
+3. **Server-rendered fallback** - `GET https://www.kroger.com/search?query=<keyword>` (embedded `window.__INITIAL_STATE__`)
 
-The listing response contains `data.productsSearch` and `meta.productsSearch`. Each listing record provides the product UPC, description, brand name, search rank, relevance score, grouping, sub-commodity codes, personalization state, and optional sponsored placement data. The response also provides `totalCount`, page offsets, page size, and `hasMore` information.
+All three are accessed with Impit only. No browser automation is used. The `ios18` browser profile is used for the two `/atlas` endpoints; the `chrome` profile is used for the fallback page.
 
-A live browser validation on 2026-09-10 returned HTTP 200 for both a normal keyword (`perfume`) and a UPC query (`0001111046235`). The UPC query returned the matching product through the listing endpoint, so direct product URL inputs can use the same listing path without opening the product-detail API or product page.
+## Search listing endpoint
 
-## Candidate matrix
+- **Query:** `option.groupBy=PRODUCT_VARIANT`, `option.quickFacets=true`, `filter.locationId=02100537`, `filter.query=<keyword>`, `filter.fulfillmentMethods=IN_STORE|PICKUP|DELIVERY`, `page.offset`, `page.size`, `option.personalization=PURCHASE_HISTORY`, `sortCriteria`, `sortOrder`.
+- **Pagination:** `page.offset` increments by `page.size`. `page.size=100` works; `page.size>=200` returns HTTP 400. The actor uses `page.size=100`.
+- **Response:** `data.productsSearch[]` with `upc`, `description`, `brandName`, `subCommodityCode`, `personalized`, `relevanceScore`, `searchEngineRank`, `groupedBy`, and optional `placementId`. `meta.productsSearch.totalCount` reports the full catalog size.
+- **Ordering:** `sortCriteria=relevance|popularity|price|description` with `sortOrder=asc|desc` is honored.
 
-| Candidate | Validation | Decision |
-| --- | --- | --- |
-| Listing search endpoint | Browser request returned HTTP 200, expected `data.productsSearch`, and pagination metadata | **Selected** |
-| Product-detail endpoint | Not required for the requested output; adds a blocked request after listing and was the failure-prone step | Rejected |
-| Direct Impit request | Fast path, but Kroger can return HTTP 403/429 or reset the connection | Kept as first attempt only |
-| Browser-context listing fetch | A real Chrome page completes the edge challenge, then same-origin `fetch()` returns the listing JSON | **Fallback selected** |
-| HTML product cards | Rendered successfully but are not required when listing JSON is available | Rejected |
-| URLScan and guessed mobile/app endpoints | No stronger source was needed after live listing validation | Not selected |
+The listing records do **not** include prices or ratings, so details are fetched separately.
+
+## Product details endpoint
+
+- **Query:** one or more `filter.gtin13s=<upc>`, `filter.verified=true`, `filter.locationId=02100537`, and `projections=items.full,offers.compact,nutrition.label,inventory.projected,variantGroupings.compact`.
+- **Batching:** up to 100 UPCs per request return all requested products (verified with a 100-UPC batch).
+- **Response:** `data.products[]` containing `item` (with `ratingsAndReviewsAggregate`), `price.storePrices`, `inventory`, `location`, `inventorySummaries`, `fulfillmentOptions`, and `nutrition`.
+- `item.ratingsAndReviewsAggregate` provides `averageRating`, `numberOfReviews`, and the 1-5 star breakdown. **This is the reviews source.**
+
+## Akamai behavior and profile matrix
+
+| Context                                       | `chrome`                      | `ios18`         | `okhttp`            |
+| --------------------------------------------- | ----------------------------- | --------------- | ------------------- |
+| `/atlas` API from a challenged IP (local dev) | 403 Access Denied             | 429 `cpr_chlge` | HTTP/2 stream reset |
+| `/atlas` API from Apify (direct, no proxy)    | 403 Access Denied             | **200 JSON**    | error               |
+| `/atlas` API through Apify RESIDENTIAL        | 403                           | 429 `cpr_chlge` | error               |
+| `/search` page from Apify                     | 200 (HTML state, 24 products) | 200 mobile stub | error               |
+
+Key finding: the `ios18` profile reaches the `/atlas` endpoints **directly from Apify**, while the residential proxy triggers the Akamai challenge. The actor therefore uses direct requests for the API and keeps the proxy only for the HTML fallback.
+
+Intermittent HTTP 429 challenges occur on repeated API calls. The actor retries with a fresh Impit session (new connection) and bounded backoff, which clears them.
 
 ## Runtime strategy
 
-1. Open one persistent Patchright Chrome session on the **search page** before making the first listing request. The actor waits for the page/challenge to settle, but does not require Kroger's own listing XHR to be captured.
-2. Fetch the listing endpoint from that same browser page with the required LAF and channel headers.
-3. If the browser session cannot obtain JSON after bounded retries, try the configured Apify Residential proxy with Impit, then direct Impit when a proxy was configured.
-4. Map and save listing records immediately. Search runs never call `/atlas/v1/product/v2/products`.
-5. Preserve the complete raw listing record in `listing_data` and bounded pagination/search metadata in `listing_metadata`.
-6. Close the browser session in `finally`, while preserving the original actor error for Apify.
+1. Collect the server-rendered search page through the configured proxy, across all supported sort orders, and merge the products by UPC. This is the reliable primary path and yields roughly 56-65 unique products per common query.
+2. If the result limit is not met, extend with the paginated listing endpoint (`page.size=100`) and the product details endpoint in batches of up to 100. This is best-effort because Akamai challenges those endpoints intermittently.
+3. Map each listing record with its detail record. If a detail is missing, emit the listing record rather than dropping the product.
+4. Preserve the complete raw listing record in `listing_data`, the full product in `product_data`, and catalog metadata in `listing_metadata`.
 
-The actor does not log cookies, tokens, proxy credentials, or full response bodies. Empty or malformed listing responses remain fatal because they cannot produce trustworthy product records; a blocked detail request can no longer fail a search run because no detail request is made.
+## Verified on Apify
+
+- HTML primary path (`keyword=cream`, build 1.0.40): 65 products, 64 with details, saved successfully.
+- Full API path when Akamai allows it (build 1.0.39, `keyword=milk, results_wanted=300, max_pages=5`): **154 products, all with details**.
+
+## Known limitations
+
+- `page.size` above 100 is rejected, and `page.offset` beyond `totalCount` returns an empty list.
+- API coverage is bounded by `results_wanted` and `max_pages` (`max_pages * 100` products).
+- Akamai intermittently serves an HTTP 429 `cpr_chlge` challenge on the `/atlas` endpoints. This depends on egress IP reputation, not on the code path. The actor retries five times with bounded backoff, then relies on the search-page path.
+
+## HTML search-page coverage
+
+The server-rendered search page returns 24 products per sort order. The actor requests the page across all supported sort orders (relevance, popularity, price ascending, price descending, alphabetical) and merges the products by UPC. Measured unique coverage:
+
+| Query     | Products |
+| --------- | -------- |
+| milk      | 61       |
+| cream     | 62-65    |
+| cereal    | 61       |
+| olive oil | 56       |
+
+## Proxy configuration
+
+Apify Residential is the default group and is used for the primary search-page requests. If a proxied request is blocked, the actor retries it directly. The API extension uses direct requests first, then the proxy for any missing details.
+
+- Search page (primary): proxied -> direct.
+- API extension: direct -> proxied.

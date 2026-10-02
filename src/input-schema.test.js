@@ -28,18 +28,20 @@ describe('actor input configuration', () => {
         expect(sampleInput).not.toHaveProperty('keyword');
     });
 
-    it('defaults cloud runs to the tested Apify Residential group', () => {
+    it('defaults cloud runs to the tested Apify Residential fallback group', () => {
         expect(inputSchema.properties.proxyConfiguration.default).toMatchObject({
             useApifyProxy: true,
             apifyProxyGroups: ['RESIDENTIAL'],
         });
     });
 
-    it('uses the listing endpoint without product-detail enrichment', () => {
+    it('uses the paginated search and product endpoints without browser automation', () => {
         expect(actorSource).toContain('/atlas/v1/search/v1/products-search');
-        expect(actorSource).not.toContain('/atlas/v1/product/v2/products');
-        expect(actorSource).toContain('fetchJsonBrowserFirst');
+        expect(actorSource).toContain('/atlas/v1/product/v2/products');
+        expect(actorSource).toContain('page.offset');
+        expect(actorSource).toContain('__INITIAL_STATE__');
         expect(actorSource).toContain('listing_data');
-        expect(actorSource).not.toContain('product detail requests are disabled');
+        expect(actorSource).not.toContain('patchright');
+        expect(actorSource).not.toContain('chromium');
     });
 });

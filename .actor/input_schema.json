@@ -36,7 +36,7 @@
         "results_wanted": {
             "title": "Results wanted",
             "type": "integer",
-            "description": "Maximum number of products to save.",
+            "description": "Maximum number of products to save. The Actor pages through Kroger until this many products are collected or the catalog is exhausted.",
             "minimum": 1,
             "default": 20,
             "prefill": 20,
@@ -45,7 +45,7 @@
         "max_pages": {
             "title": "Maximum search pages",
             "type": "integer",
-            "description": "Maximum number of 24-product search pages to request.",
+            "description": "Maximum number of search batches to request. Each batch returns up to 100 products, so the Actor can collect up to 100 products per page.",
             "minimum": 1,
             "default": 3,
             "prefill": 3,
@@ -54,7 +54,7 @@
         "proxyConfiguration": {
             "title": "Proxy configuration",
             "type": "object",
-            "description": "Optional Apify Proxy configuration for requests to Kroger.",
+            "description": "Apify Proxy configuration. Residential is used by default as a fallback if direct requests are blocked.",
             "editor": "proxy",
             "default": {
                 "useApifyProxy": true,

@@ -1,23 +1,41 @@
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-
 import { Actor, log } from 'apify';
 import { Impit } from 'impit';
-import { chromium } from 'patchright';
 
-const SEARCH_PAGE_SIZE = 24;
-
-const DEFAULT_LOCATION_ID = '02100537';
-const DEFAULT_FACILITY_ID = '4000';
-const DEFAULT_ASSORTMENT_KEY = '5b3c218b-e8ae-490b-8fd5-9dd2d7bcae6f';
-const DEFAULT_FULFILLMENT_METHODS = ['IN_STORE', 'PICKUP', 'DELIVERY'];
-
-const BROWSER_NAVIGATION_TIMEOUT_MS = 75000;
-const BROWSER_REQUEST_TIMEOUT_MS = 30000;
-
+// Kroger product data is collected in two stages:
+//   1. The server-rendered search page, whose embedded `window.__INITIAL_STATE__` holds
+//      24 full products per sort order. Several sort orders are merged for coverage. This
+//      path is reliable and runs through the configured proxy.
+//   2. The paginated `/atlas/v1/search/v1/products-search` + `/atlas/v1/product/v2/products`
+//      endpoints, which return the full catalog but are challenged intermittently by Akamai.
+//      They are used best-effort to extend the search-page results.
+const SEARCH_BATCH_SIZE = 100;
+const DETAIL_BATCH_SIZE = 100;
+const KROGER_ORIGIN = 'https://www.kroger.com';
 const KROGER_HOST_SUFFIX = '.kroger.com';
+const DEFAULT_LOCATION_ID = '02100537';
 
-let browserSession;
+const API_BROWSER = 'ios18';
+const HTML_BROWSER_PROFILES = ['chrome', 'firefox'];
+
+// The server-rendered search page returns 24 products per sort order. Combining the
+// supported sort orders multiplies the unique coverage when the paginated API is
+// unavailable.
+const FALLBACK_SORTS = [
+    { criteria: 'relevance', order: 'desc' },
+    { criteria: 'popularity', order: 'desc' },
+    { criteria: 'price', order: 'asc' },
+    { criteria: 'price', order: 'desc' },
+    { criteria: 'description', order: 'asc' },
+];
+
+const PRODUCT_PROJECTIONS = 'items.full,offers.compact,nutrition.label,inventory.projected,variantGroupings.compact';
+
+const REQUEST_TIMEOUT_MS = 30000;
+const API_MAX_ATTEMPTS = 3;
+const HTML_MAX_ATTEMPTS = 3;
+
+const htmlClients = new Map();
+const apiClients = new Map();
 
 await Actor.init();
 
@@ -92,17 +110,15 @@ function normalizeUrl(rawUrl) {
     return parsed;
 }
 
-function getApiOrigin(pageUrl) {
-    return pageUrl.hostname.toLowerCase() === 'kroger.com' ? 'https://www.kroger.com' : pageUrl.origin;
-}
-
 function extractUpcFromProductUrl(pageUrl) {
+    if (!pageUrl) return undefined;
     const match = pageUrl.pathname.match(/(?:^|\/)(\d{12,14})\/?$/);
     if (!match || !/\/p\//i.test(pageUrl.pathname)) return undefined;
     return match[1];
 }
 
 function getUrlQuery(pageUrl) {
+    if (!pageUrl) return undefined;
     return (
         pageUrl.searchParams.get('query') ||
         pageUrl.searchParams.get('q') ||
@@ -144,51 +160,88 @@ function resolveSort(sortBy, pageUrl) {
     return sortMap.relevance;
 }
 
-function buildSearchUrl({ apiOrigin, keyword, locationId, offset, pageSize, sort, fulfillmentMethods }) {
-    const url = new URL('/atlas/v1/search/v1/products-search', apiOrigin);
+function buildLafObject(locationId) {
+    return JSON.stringify([
+        {
+            modality: {
+                type: 'PICKUP',
+                handoffLocation: { storeId: locationId, facilityId: '4000' },
+            },
+            sources: [{ storeId: locationId, facilityId: '4000' }],
+            assortmentKeys: ['5b3c218b-e8ae-490b-8fd5-9dd2d7bcae6f'],
+            listingKeys: [locationId],
+        },
+    ]);
+}
+
+function buildSourceUrl({ keyword, sort }) {
+    const url = new URL('/search', KROGER_ORIGIN);
+    url.searchParams.set('query', keyword);
+    url.searchParams.set('searchType', 'default_search');
+    url.searchParams.set('sortCriteria', sort.criteria);
+    url.searchParams.set('sortOrder', sort.order);
+    return url.href;
+}
+
+function buildSearchApiUrl({ keyword, sort, locationId, offset, size }) {
+    const url = new URL('/atlas/v1/search/v1/products-search', KROGER_ORIGIN);
     url.searchParams.set('option.groupBy', 'PRODUCT_VARIANT');
     url.searchParams.set('option.quickFacets', 'true');
     url.searchParams.set('filter.locationId', locationId);
     url.searchParams.set('filter.query', keyword);
-    for (const method of fulfillmentMethods) url.searchParams.append('filter.fulfillmentMethods', method);
+    for (const method of ['IN_STORE', 'PICKUP', 'DELIVERY']) {
+        url.searchParams.append('filter.fulfillmentMethods', method);
+    }
     url.searchParams.set('page.offset', String(offset));
-    url.searchParams.set('page.size', String(pageSize));
+    url.searchParams.set('page.size', String(size));
     url.searchParams.set('option.personalization', 'PURCHASE_HISTORY');
     url.searchParams.set('sortCriteria', sort.criteria);
     url.searchParams.set('sortOrder', sort.order);
     return url.href;
 }
 
-function buildLafObject(locationId) {
-    return JSON.stringify([
-        {
-            modality: {
-                type: 'PICKUP',
-                handoffLocation: { storeId: locationId, facilityId: DEFAULT_FACILITY_ID },
-            },
-            sources: [{ storeId: locationId, facilityId: DEFAULT_FACILITY_ID }],
-            assortmentKeys: [DEFAULT_ASSORTMENT_KEY],
-            listingKeys: [locationId],
-        },
-    ]);
+function buildProductDetailUrl({ upcs, locationId }) {
+    const url = new URL('/atlas/v1/product/v2/products', KROGER_ORIGIN);
+    for (const upc of upcs) url.searchParams.append('filter.gtin13s', upc);
+    url.searchParams.set('filter.verified', 'true');
+    url.searchParams.set('filter.locationId', locationId);
+    url.searchParams.set('projections', PRODUCT_PROJECTIONS);
+    return url.href;
 }
 
-function getBrowserProxyOptions(proxyUrl) {
-    if (!proxyUrl) return undefined;
-
-    const parsed = new URL(proxyUrl);
-    const proxy = { server: `${parsed.protocol}//${parsed.host}` };
-    if (parsed.username) proxy.username = decodeURIComponent(parsed.username);
-    if (parsed.password) proxy.password = decodeURIComponent(parsed.password);
-    return proxy;
+function getApiHeaders(locationId) {
+    return {
+        accept: 'application/json, text/plain, */*',
+        'accept-language': 'en-US,en;q=0.9',
+        'x-laf-object': buildLafObject(locationId),
+        'x-kroger-channel': 'WEB',
+        referer: `${KROGER_ORIGIN}/search?query=products&searchType=default_search`,
+        origin: KROGER_ORIGIN,
+        'sec-fetch-dest': 'empty',
+        'sec-fetch-mode': 'cors',
+        'sec-fetch-site': 'same-origin',
+    };
 }
 
-function isChallengeHttpError(error) {
-    return /\bHTTP (?:403|429)\b/.test(error?.message || '');
+function createApiClient(proxyUrl) {
+    // No cookie jar on purpose: Akamai returns an unvalidated `_abck` cookie, and
+    // sending it back converts the soft 429 challenge into a hard 403. Each
+    // attempt therefore starts from a clean cookie state.
+    return new Impit({
+        browser: API_BROWSER,
+        timeout: REQUEST_TIMEOUT_MS,
+        ...(proxyUrl ? { proxyUrl } : {}),
+    });
 }
 
-function isServerHttpError(error) {
-    return /\bHTTP 5\d\d\b/.test(error?.message || '');
+function getApiClient(proxyUrl) {
+    const key = proxyUrl || '__direct__';
+    if (!apiClients.has(key)) apiClients.set(key, createApiClient(proxyUrl));
+    return apiClients.get(key);
+}
+
+function resetApiClient(proxyUrl) {
+    apiClients.set(proxyUrl || '__direct__', createApiClient(proxyUrl));
 }
 
 function isTransportError(error) {
@@ -197,225 +250,325 @@ function isTransportError(error) {
     );
 }
 
-function isUnexpectedJsonError(error) {
-    return /invalid JSON|non-JSON|challenge response/i.test(error?.message || '');
+function isRetryableApiStatus(status) {
+    return status === 403 || status === 429 || status >= 500;
 }
 
-async function fetchJson(client, url, headers, label) {
-    const maxAttempts = 2;
+async function requestJson(proxyUrl, url, headers, label) {
     let lastError;
 
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    for (let attempt = 1; attempt <= API_MAX_ATTEMPTS; attempt++) {
+        let retryable = true;
         try {
+            const client = getApiClient(proxyUrl);
             const response = await client.fetch(url, { headers });
-            const body = await response.text().catch(() => '');
-            if (response.ok) {
+            const text = await response.text();
+            if (response.status === 200) {
                 try {
-                    return JSON.parse(body);
+                    return JSON.parse(text);
                 } catch {
-                    throw new Error(`${label} returned a non-JSON challenge response.`);
+                    lastError = new Error(`${label} returned invalid JSON.`);
+                    retryable = false;
                 }
+            } else {
+                lastError = new Error(`${label} returned HTTP ${response.status}.`);
+                retryable = isRetryableApiStatus(response.status);
+                log.debug(`${label} attempt ${attempt} returned HTTP ${response.status}.`);
             }
-
-            const detail = body.replace(/\s+/g, ' ').slice(0, 180);
-            lastError = new Error(`${label} returned HTTP ${response.status}${detail ? `: ${detail}` : ''}`);
-
-            if (isChallengeHttpError(lastError) || response.status < 500 || attempt === maxAttempts) {
-                throw lastError;
-            }
-
-            const delay = attempt * 1000 + Math.round(Math.random() * 500);
-            log.warning(`${label} retry ${attempt}/${maxAttempts} after HTTP ${response.status}`);
-            await sleep(delay);
         } catch (error) {
             lastError = error;
-            if (
-                isChallengeHttpError(error) ||
-                isTransportError(error) ||
-                isUnexpectedJsonError(error) ||
-                !isServerHttpError(error) ||
-                attempt === maxAttempts
-            ) {
-                throw error;
-            }
-
-            const delay = attempt * 1000 + Math.round(Math.random() * 500);
-            log.warning(`${label} retry ${attempt}/${maxAttempts}: ${error.message}`);
-            await sleep(delay);
-        }
-    }
-
-    throw lastError || new Error(`${label} failed`);
-}
-
-function isBrowserChallengeError(error) {
-    return (
-        isChallengeHttpError(error) ||
-        isServerHttpError(error) ||
-        isTransportError(error) ||
-        isUnexpectedJsonError(error)
-    );
-}
-
-async function createBrowserSession(sourceUrl, proxyUrl, attempt) {
-    const browserProxy = getBrowserProxyOptions(proxyUrl);
-    log.info(`Opening Chrome fallback${browserProxy ? ' through Apify Proxy' : ''} (attempt ${attempt}).`);
-    const browserContext = await chromium.launchPersistentContext(
-        join(tmpdir(), `kroger-product-scraper-${process.pid}-${attempt}`),
-        {
-            channel: 'chrome',
-            headless: false,
-            noViewport: true,
-            ignoreHTTPSErrors: true,
-            ...(browserProxy ? { proxy: browserProxy } : {}),
-        },
-    );
-    const page = browserContext.pages()[0] || (await browserContext.newPage());
-
-    try {
-        let navigationError;
-        try {
-            await page.goto(sourceUrl, { waitUntil: 'domcontentloaded', timeout: BROWSER_NAVIGATION_TIMEOUT_MS });
-        } catch (error) {
-            navigationError = error;
-            log.warning(`Kroger page navigation did not finish cleanly: ${error.message}`);
+            retryable = isTransportError(error);
         }
 
-        if (page.url() === 'about:blank') {
-            throw navigationError || new Error('Kroger browser navigation did not open a page.');
-        }
+        if (!retryable || attempt === API_MAX_ATTEMPTS) break;
 
-        // Let Akamai's browser challenge and the listing application finish. The
-        // API request is made after this step, so a missing/late page XHR cannot
-        // make the actor fail during bootstrap.
-        await page
-            .waitForFunction(
-                () => {
-                    const text = document.body?.innerText || '';
-                    return (
-                        document.querySelectorAll('a[href*="/p/"]').length > 0 ||
-                        /search products|products loaded|search:/i.test(text)
-                    );
-                },
-                { timeout: 30000 },
-            )
-            .catch(() =>
-                log.warning('Kroger listing UI was not ready; trying the listing API from the browser anyway.'),
-            );
-        await page.waitForTimeout(1500);
-
-        return {
-            page,
-            close: () => browserContext.close(),
-        };
-    } catch (error) {
-        await browserContext.close();
-        throw error;
-    }
-}
-
-async function fetchJsonInBrowser(
-    page,
-    url,
-    headers,
-    label,
-    requestTimeoutMs = BROWSER_REQUEST_TIMEOUT_MS,
-    maxAttempts = 2,
-) {
-    let lastError;
-
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-        let result;
-        try {
-            result = await page.evaluate(
-                async ({ requestUrl, requestHeaders, requestTimeoutMs: timeoutMs }) => {
-                    const controller = new AbortController();
-                    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-                    try {
-                        const response = await fetch(requestUrl, {
-                            credentials: 'include',
-                            headers: requestHeaders,
-                            signal: controller.signal,
-                        });
-                        return {
-                            status: response.status,
-                            body: await response.text(),
-                        };
-                    } finally {
-                        clearTimeout(timeoutId);
-                    }
-                },
-                { requestUrl: url, requestHeaders: headers, requestTimeoutMs },
-            );
-        } catch (error) {
-            lastError = error;
-            if (attempt === maxAttempts) throw error;
-            const delay = attempt * 1000 + Math.round(Math.random() * 500);
-            log.warning(`${label} browser retry ${attempt}/${maxAttempts}: ${error.message}`);
-            await sleep(delay);
-            continue;
-        }
-
-        if (result.status >= 200 && result.status < 300) {
-            try {
-                return JSON.parse(result.body);
-            } catch {
-                throw new Error(`${label} returned invalid JSON from the browser session.`);
-            }
-        }
-
-        const detail = result.body.replace(/\s+/g, ' ').slice(0, 180);
-        lastError = new Error(`${label} returned HTTP ${result.status}${detail ? `: ${detail}` : ''}`);
-        const retryable = result.status === 403 || result.status === 429 || result.status >= 500;
-        if (!retryable || attempt === maxAttempts) throw lastError;
-
-        const delay = attempt * 1000 + Math.round(Math.random() * 500);
-        log.warning(`${label} browser retry ${attempt}/${maxAttempts} after HTTP ${result.status}`);
+        // Reusing the same session usually clears the transient Akamai challenge;
+        // only rebuild the client when the connection itself failed.
+        if (isTransportError(lastError)) resetApiClient(proxyUrl);
+        const delay = attempt * 500 + Math.round(Math.random() * 400);
         await sleep(delay);
     }
 
-    throw lastError || new Error(`${label} failed in the browser session.`);
+    throw lastError || new Error(`${label} failed.`);
 }
 
-async function fetchJsonWithDirectFallback(client, directClient, url, headers, label) {
-    try {
-        return await fetchJson(client, url, headers, label);
-    } catch (error) {
-        if (directClient === client || !isBrowserChallengeError(error)) throw error;
+async function collectListing(proxyUrl, { keyword, sort, locationId, targetResults, maxRequests, headers }) {
+    const items = [];
+    const seen = new Set();
+    let totalCount = 0;
 
-        log.warning(`${label} was blocked through Apify Proxy; retrying with direct Impit.`);
-        return fetchJson(directClient, url, headers, label);
-    }
-}
+    for (let request = 1; request <= maxRequests && items.length < targetResults; request++) {
+        const offset = (request - 1) * SEARCH_BATCH_SIZE;
+        const url = buildSearchApiUrl({
+            keyword,
+            sort,
+            locationId,
+            offset,
+            size: SEARCH_BATCH_SIZE,
+        });
 
-async function fetchJsonBrowserFirst(client, directClient, url, headers, label, sourceUrl) {
-    let lastBrowserError;
-
-    for (let attempt = 1; attempt <= 2; attempt++) {
+        let data;
         try {
-            if (!browserSession) {
-                browserSession = await createBrowserSession(sourceUrl, undefined, attempt);
-            }
-            return await fetchJsonInBrowser(browserSession.page, url, headers, label);
+            data = await requestJson(proxyUrl, url, headers, `Search page ${request}`);
         } catch (error) {
-            lastBrowserError = error;
-            await browserSession?.close();
-            browserSession = undefined;
-            if (attempt < 2) {
-                log.warning(`${label} Patchright session failed; retrying browser bootstrap.`);
+            // A failure on the first page means the source is unavailable. A
+            // failure on a later page keeps the products collected so far.
+            if (!items.length) throw error;
+            log.warning(`Search page ${request} failed after ${items.length} products: ${error.message}`);
+            break;
+        }
+
+        const pageItems = data?.data?.productsSearch;
+        if (!Array.isArray(pageItems)) {
+            if (!items.length) throw new Error(`Search page ${request} did not contain data.productsSearch.`);
+            break;
+        }
+
+        totalCount = Number(data?.meta?.productsSearch?.totalCount || totalCount || 0);
+
+        let added = 0;
+        for (const item of pageItems) {
+            const upc = String(item?.upc || '').trim();
+            if (!upc || seen.has(upc)) continue;
+            seen.add(upc);
+            items.push(item);
+            added++;
+            if (items.length >= targetResults) break;
+        }
+
+        log.info(
+            `Listing page ${request} | offset=${offset} | new=${added} | collected=${items.length}/${targetResults} | total_available=${totalCount}`,
+        );
+
+        if (!pageItems.length || added === 0) break;
+        if (totalCount > 0 && offset + SEARCH_BATCH_SIZE >= totalCount) break;
+    }
+
+    return { items, totalCount };
+}
+
+async function fetchProductDetails(proxyUrl, { upcs, locationId, headers }) {
+    const details = new Map();
+    const batches = [];
+    for (let i = 0; i < upcs.length; i += DETAIL_BATCH_SIZE) {
+        batches.push(upcs.slice(i, i + DETAIL_BATCH_SIZE));
+    }
+
+    for (let index = 0; index < batches.length; index++) {
+        const batch = batches[index];
+        const url = buildProductDetailUrl({ upcs: batch, locationId });
+        try {
+            const data = await requestJson(proxyUrl, url, headers, `Product details batch ${index + 1}`);
+            for (const product of data?.data?.products || []) {
+                const upc = String(product?.item?.upc || product?.upc || '').trim();
+                if (upc) details.set(upc, product);
             }
+        } catch (error) {
+            log.warning(`Product details batch ${index + 1} failed: ${error.message}`);
         }
     }
 
-    log.warning(
-        `${label} could not be fetched with Patchright; trying the configured residential/direct HTTP fallback.`,
-    );
-    try {
-        return await fetchJsonWithDirectFallback(client, directClient, url, headers, label);
-    } catch (error) {
-        if (lastBrowserError && isBrowserChallengeError(lastBrowserError)) throw error;
-        throw lastBrowserError || error;
+    return details;
+}
+
+// The server-rendered search page embeds `window.__INITIAL_STATE__ = JSON.parse('<json>')`.
+// Decode the JavaScript string literal first, then parse the JSON it contains.
+function decodeJsStringLiteral(source, startIndex, quoteChar) {
+    let out = '';
+    for (let i = startIndex + 1; i < source.length; i++) {
+        const char = source[i];
+        if (char === '\\') {
+            const next = source[i + 1];
+            switch (next) {
+                case 'n':
+                    out += '\n';
+                    i++;
+                    break;
+                case 't':
+                    out += '\t';
+                    i++;
+                    break;
+                case 'r':
+                    out += '\r';
+                    i++;
+                    break;
+                case 'b':
+                    out += '\b';
+                    i++;
+                    break;
+                case 'f':
+                    out += '\f';
+                    i++;
+                    break;
+                case 'v':
+                    out += '\v';
+                    i++;
+                    break;
+                case '0':
+                    out += '\0';
+                    i++;
+                    break;
+                case 'x':
+                    out += String.fromCharCode(parseInt(source.slice(i + 2, i + 4), 16));
+                    i += 3;
+                    break;
+                case 'u':
+                    out += String.fromCharCode(parseInt(source.slice(i + 2, i + 6), 16));
+                    i += 5;
+                    break;
+                default:
+                    out += next;
+                    i++;
+                    break;
+            }
+        } else if (char === quoteChar) {
+            return out;
+        } else {
+            out += char;
+        }
     }
+    throw new Error('Kroger search page contained an unterminated state payload.');
+}
+
+function extractInitialState(html) {
+    const match = /window\.__INITIAL_STATE__\s*=\s*JSON\.parse\(\s*(['"])/.exec(html);
+    if (!match) return null;
+    const quoteChar = match[1];
+    const quoteIndex = match.index + match[0].length - 1;
+    return JSON.parse(decodeJsStringLiteral(html, quoteIndex, quoteChar));
+}
+
+function getHtmlClient(browser, proxyUrl) {
+    const key = `${browser}|${proxyUrl || ''}`;
+    if (!htmlClients.has(key)) {
+        htmlClients.set(
+            key,
+            new Impit({
+                browser,
+                timeout: REQUEST_TIMEOUT_MS,
+                ...(proxyUrl ? { proxyUrl } : {}),
+            }),
+        );
+    }
+    return htmlClients.get(key);
+}
+
+async function fetchSearchHtml(sourceUrl, proxyUrl) {
+    let lastError;
+
+    for (let attempt = 1; attempt <= HTML_MAX_ATTEMPTS; attempt++) {
+        const browser = HTML_BROWSER_PROFILES[Math.min(attempt - 1, HTML_BROWSER_PROFILES.length - 1)];
+        const client = getHtmlClient(browser, proxyUrl);
+        let retryable = true;
+
+        try {
+            const response = await client.fetch(sourceUrl, {
+                headers: {
+                    accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                    'accept-language': 'en-US,en;q=0.9',
+                },
+            });
+
+            if (response.ok) {
+                const body = await response.text();
+                if (body.includes('__INITIAL_STATE__')) return body;
+                lastError = new Error('Kroger search page did not contain the expected product data.');
+                retryable = false;
+            } else {
+                lastError = new Error(`Kroger search page returned HTTP ${response.status}.`);
+                retryable = response.status === 403 || response.status === 429 || response.status >= 500;
+            }
+        } catch (error) {
+            lastError = error;
+            const status = Number((error.message.match(/HTTP (\d{3})/) || [])[1] || 0);
+            retryable = isTransportError(error) || isRetryableApiStatus(status);
+        }
+
+        if (!retryable || attempt === HTML_MAX_ATTEMPTS) break;
+
+        const nextBrowser = HTML_BROWSER_PROFILES[Math.min(attempt, HTML_BROWSER_PROFILES.length - 1)];
+        const delay = attempt * 1500 + Math.round(Math.random() * 750);
+        log.warning(
+            `Kroger search page attempt ${attempt}/${HTML_MAX_ATTEMPTS} failed (${lastError.message}); retrying with the ${nextBrowser} profile.`,
+        );
+        await sleep(delay);
+    }
+
+    throw lastError || new Error('Kroger search page could not be loaded.');
+}
+
+function extractHtmlListing(state) {
+    const grid = state?.calypso?.useCases?.getProducts?.['search-grid']?.response?.data?.products;
+    const listing = state?.search?.searchAll?.response?.products;
+    const productsInfo = state?.search?.searchAll?.response?.productsInfo || {};
+    return {
+        products: Array.isArray(grid) ? grid : [],
+        listing: Array.isArray(listing) ? listing : [],
+        productsInfo,
+    };
+}
+
+async function collectFromSearchPage({ keyword, sort, targetResults, proxyUrl }) {
+    const productsByUpc = new Map();
+    const listingByUpc = new Map();
+    let metadata;
+    let lastError;
+
+    const sorts = [sort, ...FALLBACK_SORTS].filter(
+        (candidate, index, all) =>
+            all.findIndex((other) => other.criteria === candidate.criteria && other.order === candidate.order) ===
+            index,
+    );
+
+    for (const candidateSort of sorts) {
+        if (productsByUpc.size >= targetResults) break;
+        const url = buildSourceUrl({ keyword, sort: candidateSort });
+
+        let state;
+        try {
+            state = extractInitialState(await fetchSearchHtml(url, proxyUrl));
+        } catch (error) {
+            if (!proxyUrl) {
+                lastError = error;
+                log.debug(`Search page ${candidateSort.criteria}/${candidateSort.order} failed: ${error.message}`);
+                continue;
+            }
+            try {
+                state = extractInitialState(await fetchSearchHtml(url, undefined));
+            } catch (directError) {
+                lastError = directError;
+                log.debug(
+                    `Search page ${candidateSort.criteria}/${candidateSort.order} failed: ${directError.message}`,
+                );
+                continue;
+            }
+        }
+        if (!state) continue;
+
+        const htmlListing = extractHtmlListing(state);
+        for (const product of htmlListing.products) {
+            const upc = String(product?.item?.upc || '').trim();
+            if (upc && !productsByUpc.has(upc)) productsByUpc.set(upc, product);
+        }
+        for (const item of htmlListing.listing) {
+            const upc = String(item?.upc || '').trim();
+            if (upc && !listingByUpc.has(upc)) listingByUpc.set(upc, item);
+        }
+        if (!metadata) {
+            metadata = cleanValue({
+                total_count: htmlListing.productsInfo.totalCount,
+                available_count: htmlListing.productsInfo.availableCount,
+                search_id: htmlListing.productsInfo.searchId,
+                sort: { criteria: sort.criteria, order: sort.order },
+            });
+        }
+        log.info(
+            `Search page | sort=${candidateSort.criteria}/${candidateSort.order} | collected=${productsByUpc.size}`,
+        );
+    }
+
+    if (!productsByUpc.size && lastError) throw lastError;
+    return { productsByUpc, listingByUpc, metadata };
 }
 
 function mapNutrition(product) {
@@ -448,13 +601,17 @@ function mapProduct(product, searchItem, sourceUrl, locationId) {
         regularPrice?.price || regularPrice?.nforPrice || regularPrice?.defaultDescription,
     );
     const promoPriceValue = parseMoney(promoPrice?.price || promoPrice?.nforPrice || promoPrice?.defaultDescription);
-    const availability = product?.inventorySummaries?.[0];
+    const availability = product?.inventorySummaries?.[0] || product?.fulfillmentSummaries?.[0];
+    const availabilityState =
+        availability?.details?.[0]?.availableToSell > 0 || availability?.availability?.sellable === true
+            ? 'IN_STOCK'
+            : availability?.stockLevel || availability?.availability?.inventoryLevel;
 
     return cleanValue({
         product_id: item.upc || product.id || searchItem?.upc,
         upc: item.upc || product.id || searchItem?.upc,
         name: item.description || searchItem?.description,
-        brand: typeof item.brand === 'string' ? item.brand : item.brand?.name,
+        brand: typeof item.brand === 'string' ? item.brand : item.brand?.name || searchItem?.brandName,
         size: item.customerFacingSize || item.size,
         category: item.categories?.map((category) => category.name).filter(isNonEmpty),
         department: item.familyTree?.department?.name,
@@ -475,12 +632,20 @@ function mapProduct(product, searchItem, sourceUrl, locationId) {
         sale_price_display: promoPrice?.defaultDescription,
         unit_price: regularPrice?.equivalizedUnitPriceString,
         currency: regularPrice?.price?.match(/[A-Z]{3}/)?.[0] || promoPrice?.price?.match(/[A-Z]{3}/)?.[0],
-        availability: availability?.details?.[0]?.availableToSell > 0 ? 'IN_STOCK' : availability?.stockLevel,
-        stock_level: firstInventory?.stockLevel || availability?.stockLevel,
+        availability: availabilityState,
+        stock_level:
+            firstInventory?.stockLevel || availability?.stockLevel || availability?.availability?.inventoryLevel,
         quantity_available: firstInventory?.available || availability?.availableToSell,
         fulfillment_options: product?.fulfillmentOptions,
         rating: aggregate.averageRating,
         reviews_count: aggregate.numberOfReviews,
+        rating_breakdown: cleanValue({
+            five_star: aggregate.numOfFiveStarRating,
+            four_star: aggregate.numOfFourStarRating,
+            three_star: aggregate.numOfThreeStarRating,
+            two_star: aggregate.numOfTwoStarRating,
+            one_star: aggregate.numOfOneStarRating,
+        }),
         image_url: frontImage,
         image_urls: images,
         aisle: firstLocation?.aisle?.description,
@@ -499,30 +664,38 @@ function mapProduct(product, searchItem, sourceUrl, locationId) {
     });
 }
 
-function mapSearchProduct(searchItem, sourceUrl, locationId, listingMetadata) {
-    const candidate = searchItem?.product || searchItem;
-    const sourceItem = candidate?.item || searchItem?.item;
-    const item = {
-        ...(sourceItem || candidate || {}),
-        upc: sourceItem?.upc || candidate?.upc || searchItem?.upc,
-        description: sourceItem?.description || candidate?.description || searchItem?.description,
-        brand: sourceItem?.brand || candidate?.brand || searchItem?.brandName,
-    };
-    const product = {
-        ...searchItem,
-        ...candidate,
-        item,
-        id: candidate?.id || searchItem?.id || item.upc,
-    };
-    const mapped = mapProduct(product, searchItem, sourceUrl, locationId);
+function mapRecord(detailProduct, listingItem, sourceUrl, locationId, listingMetadata) {
+    const base = detailProduct
+        ? mapProduct(detailProduct, listingItem, sourceUrl, locationId)
+        : cleanValue({
+              product_id: listingItem?.upc,
+              upc: listingItem?.upc,
+              name: listingItem?.description,
+              brand: listingItem?.brandName,
+              search_rank: listingItem?.searchEngineRank,
+              relevance_score: listingItem?.relevanceScore,
+              sponsored: Boolean(listingItem?.placementId),
+              location_id: locationId,
+              source_url: sourceUrl,
+              scraped_at: new Date().toISOString(),
+          });
+
     return cleanValue({
-        ...mapped,
-        group_id: searchItem?.groupedBy && searchItem.groupedBy !== 'NONE' ? searchItem.groupedBy : undefined,
-        sub_commodity_codes: searchItem?.subCommodityCode,
-        personalized: searchItem?.personalized,
-        placement_id: searchItem?.placementId,
-        listing_data: searchItem,
+        ...base,
+        group_id: listingItem?.groupedBy && listingItem.groupedBy !== 'NONE' ? listingItem.groupedBy : undefined,
+        sub_commodity_codes: listingItem?.subCommodityCode,
+        personalized: listingItem?.personalized,
+        placement_id: listingItem?.placementId,
+        listing_data: listingItem,
+        product_data: detailProduct,
         listing_metadata: listingMetadata,
+    });
+}
+
+function buildApiListingMetadata(totalCount, sort) {
+    return cleanValue({
+        total_count: totalCount,
+        sort: { criteria: sort.criteria, order: sort.order },
     });
 }
 
@@ -542,143 +715,153 @@ async function main() {
     const resultsWanted = Number.isFinite(Number(resultsWantedRaw)) ? Math.max(1, Number(resultsWantedRaw)) : 20;
     const maxPages = Number.isFinite(Number(maxPagesRaw)) ? Math.max(1, Number(maxPagesRaw)) : 3;
     const pageUrl = normalizeUrl(getRawStartUrl({ startUrl, url, startUrls }));
-    const productUrlUpc = extractUpcFromProductUrl(pageUrl || new URL('https://www.kroger.com'));
-    const parsedKeyword = pageUrl ? getUrlQuery(pageUrl) : undefined;
+    const productUrlUpc = extractUpcFromProductUrl(pageUrl);
+    const parsedKeyword = getUrlQuery(pageUrl);
     const effectiveKeyword =
         productUrlUpc || (pageUrl ? String(parsedKeyword || '').trim() : String(keyword || '').trim());
-    const effectiveLocationId = DEFAULT_LOCATION_ID;
-    const sourceUrl =
-        pageUrl?.href ||
-        `https://www.kroger.com/search?query=${encodeURIComponent(effectiveKeyword)}&searchType=default_search`;
-    const listingSourceUrl = productUrlUpc
-        ? `https://www.kroger.com/search?query=${encodeURIComponent(productUrlUpc)}&searchType=default_search`
-        : sourceUrl;
-    const apiOrigin = getApiOrigin(pageUrl || new URL('https://www.kroger.com'));
-    const sort = resolveSort(pageUrl?.searchParams.has('sortCriteria') ? undefined : sortBy, pageUrl);
-    const methods = DEFAULT_FULFILLMENT_METHODS;
-    const lafHeader = buildLafObject(effectiveLocationId);
 
     if (!effectiveKeyword) {
         throw new Error('Provide either keyword or a Kroger search/product startUrl.');
     }
 
-    const effectiveProxyConfiguration =
+    const sort = resolveSort(pageUrl?.searchParams.has('sortCriteria') ? undefined : sortBy, pageUrl);
+    const sourceUrl = buildSourceUrl({ keyword: effectiveKeyword, sort });
+    const locationId = DEFAULT_LOCATION_ID;
+    const apiHeaders = getApiHeaders(locationId);
+
+    const targetResults = productUrlUpc ? Math.min(resultsWanted, 1) : resultsWanted;
+    const maxRequests = productUrlUpc ? 1 : maxPages;
+
+    log.info(
+        `Starting Kroger product run | keyword=${effectiveKeyword} | results=${targetResults} | max_pages=${maxRequests}`,
+    );
+
+    const proxyUrl = await resolveProxyUrl(proxyConfiguration);
+
+    // Primary path: the server-rendered search page is reliable and works through the
+    // proxy. It returns 24 products per sort order, so several orders are merged to
+    // maximize coverage.
+    const htmlResult = await collectFromSearchPage({
+        keyword: effectiveKeyword,
+        sort,
+        targetResults,
+        proxyUrl,
+    });
+
+    const productsByUpc = new Map(htmlResult.productsByUpc);
+    const listingByUpc = new Map(htmlResult.listingByUpc);
+    let totalCount = Number(htmlResult.metadata?.total_count || 0);
+
+    if (!productsByUpc.size) {
+        log.warning('Kroger returned no products for this search.');
+        log.info('Finished | saved=0 | stop_reason=no products found');
+        return;
+    }
+
+    // Extension: when the result limit is not met, try the paginated endpoint for full
+    // coverage. This is best-effort because Akamai challenges it intermittently.
+    let apiExtensionAttempted = false;
+    if (productsByUpc.size < targetResults) {
+        apiExtensionAttempted = true;
+        const listingArgs = {
+            keyword: effectiveKeyword,
+            sort,
+            locationId,
+            targetResults,
+            maxRequests,
+            headers: apiHeaders,
+        };
+
+        let apiListing = [];
+        try {
+            const collected = await collectListing(undefined, listingArgs);
+            apiListing = collected.items;
+            if (collected.totalCount) totalCount = collected.totalCount;
+        } catch (directError) {
+            log.debug(`Direct search API unavailable: ${directError.message}`);
+            if (proxyUrl) {
+                try {
+                    const collected = await collectListing(proxyUrl, listingArgs);
+                    apiListing = collected.items;
+                    if (collected.totalCount) totalCount = collected.totalCount;
+                } catch (proxyError) {
+                    log.debug(`Proxied search API unavailable: ${proxyError.message}`);
+                }
+            }
+        }
+
+        const newUpcs = [];
+        const newUpcSet = new Set();
+        for (const item of apiListing) {
+            const upc = String(item.upc || '').trim();
+            if (!upc) continue;
+            if (!listingByUpc.has(upc)) listingByUpc.set(upc, item);
+            if (!productsByUpc.has(upc) && !newUpcSet.has(upc)) {
+                newUpcSet.add(upc);
+                newUpcs.push(upc);
+            }
+        }
+
+        if (newUpcs.length) {
+            const detailArgs = { upcs: newUpcs, locationId, headers: apiHeaders };
+            const details = await fetchProductDetails(undefined, detailArgs);
+            const missingUpcs = newUpcs.filter((upc) => !details.has(upc));
+            if (missingUpcs.length && proxyUrl) {
+                const proxyDetails = await fetchProductDetails(proxyUrl, { ...detailArgs, upcs: missingUpcs });
+                for (const [upc, product] of proxyDetails) details.set(upc, product);
+            }
+            for (const upc of newUpcs) {
+                const product = details.get(upc);
+                if (product) productsByUpc.set(upc, product);
+            }
+            log.info(`Extended with ${newUpcs.length} products from the search API.`);
+        } else if (!apiListing.length) {
+            log.warning(
+                `Kroger is limiting full-catalog paging right now, so only the ${productsByUpc.size} products from the search page are available.`,
+            );
+        }
+    }
+
+    const listingMetadata = buildApiListingMetadata(totalCount, sort);
+    const orderedUpcs = [...productsByUpc.keys()];
+    for (const upc of listingByUpc.keys()) {
+        if (!productsByUpc.has(upc)) orderedUpcs.push(upc);
+    }
+
+    const batch = [];
+    for (const upc of orderedUpcs) {
+        if (batch.length >= targetResults) break;
+        batch.push(mapRecord(productsByUpc.get(upc), listingByUpc.get(upc), sourceUrl, locationId, listingMetadata));
+    }
+
+    if (batch.length) await Actor.pushData(batch);
+
+    const detailCoverage = batch.filter((record) => record.product_data).length;
+    let stopReason = 'result limit reached';
+    if (batch.length < targetResults) {
+        stopReason = apiExtensionAttempted ? 'search page coverage (API unavailable)' : 'source exhausted';
+    }
+    log.info(
+        `Finished | saved=${batch.length}/${targetResults} | with_details=${detailCoverage} | total_available=${totalCount} | stop_reason=${stopReason}`,
+    );
+}
+
+async function resolveProxyUrl(proxyConfiguration) {
+    const effective =
         proxyConfiguration === undefined
             ? { useApifyProxy: true, apifyProxyGroups: ['RESIDENTIAL'] }
             : proxyConfiguration;
-    let proxyUrl;
-    let proxyConf;
-    if (
-        Actor.isAtHome() &&
-        (effectiveProxyConfiguration?.useApifyProxy || effectiveProxyConfiguration?.proxyUrls?.length)
-    ) {
-        proxyConf = await Actor.createProxyConfiguration({ ...effectiveProxyConfiguration });
-        proxyUrl = await proxyConf.newUrl();
-        const proxyGroup = effectiveProxyConfiguration?.apifyProxyGroups?.join(',') || 'configured';
-        log.info(`Using Apify ${proxyGroup} proxy for the Impit HTTP fallback.`);
-    } else if (effectiveProxyConfiguration?.useApifyProxy) {
+    if (Actor.isAtHome() && (effective?.useApifyProxy || effective?.proxyUrls?.length)) {
+        const proxyConf = await Actor.createProxyConfiguration({ ...effective });
+        const proxyUrl = await proxyConf.newUrl();
+        const proxyGroup = effective?.apifyProxyGroups?.join(',') || 'configured';
+        log.info(`Using Apify ${proxyGroup} proxy for Kroger requests.`);
+        return proxyUrl;
+    }
+    if (effective?.useApifyProxy && !Actor.isAtHome()) {
         log.info('Apify Proxy requested, but local execution is not running on Apify; continuing without proxy.');
     }
-
-    const client = new Impit({
-        browser: 'chrome',
-        ignoreTlsErrors: true,
-        timeout: 15000,
-        ...(proxyUrl ? { proxyUrl } : {}),
-    });
-    const directClient = proxyUrl
-        ? new Impit({
-              browser: 'chrome',
-              ignoreTlsErrors: true,
-              timeout: 15000,
-          })
-        : client;
-    const requestHeaders = {
-        accept: 'application/json',
-        'accept-language': 'en-US,en;q=0.9',
-        'x-laf-object': lafHeader,
-        'x-kroger-channel': 'WEB',
-        referer: listingSourceUrl,
-    };
-    const fetchData = (requestUrl, label) =>
-        fetchJsonBrowserFirst(client, directClient, requestUrl, requestHeaders, label, listingSourceUrl);
-    const targetResults = productUrlUpc ? Math.min(resultsWanted, 1) : resultsWanted;
-    const targetPages = productUrlUpc ? 1 : maxPages;
-    const seenUpcs = new Set();
-    let saved = 0;
-    let pagesProcessed = 0;
-    let stopReason = 'result limit reached';
-
-    log.info(
-        `Starting Kroger product run | keyword=${effectiveKeyword} | results=${targetResults} | max_pages=${targetPages}`,
-    );
-
-    for (let pageNumber = 1; pageNumber <= targetPages && saved < targetResults; pageNumber++) {
-        const offset = (pageNumber - 1) * SEARCH_PAGE_SIZE;
-        const searchUrl = buildSearchUrl({
-            apiOrigin,
-            keyword: effectiveKeyword,
-            locationId: effectiveLocationId,
-            offset,
-            pageSize: SEARCH_PAGE_SIZE,
-            sort,
-            fulfillmentMethods: methods,
-        });
-        const searchData = await fetchData(searchUrl, `Search page ${pageNumber}`);
-        const searchItems = searchData?.data?.productsSearch;
-        if (!Array.isArray(searchItems)) {
-            throw new Error(`Search page ${pageNumber} did not contain data.productsSearch.`);
-        }
-
-        pagesProcessed = pageNumber;
-        const pageUpcs = searchItems.map((item) => String(item.upc || '').trim()).filter(Boolean);
-        const remainingResults = Math.max(0, targetResults - saved);
-        const newUpcs = pageUpcs.filter((upc) => !seenUpcs.has(upc)).slice(0, remainingResults);
-        const newUpcSet = new Set(newUpcs);
-        newUpcs.forEach((upc) => seenUpcs.add(upc));
-
-        if (!newUpcs.length) {
-            stopReason = 'no new products';
-            break;
-        }
-
-        const searchMetadata = searchData?.meta?.productsSearch || {};
-        const listingMetadata = {
-            page: searchMetadata.page,
-            total_count: searchMetadata.totalCount,
-            available_count: searchMetadata.availableCount,
-            sort: searchMetadata.sort,
-            search_configuration_id: searchMetadata.searchConfigurationId,
-            search_workflow: searchMetadata.searchWorkflow,
-        };
-
-
-        const batch = [];
-        for (const searchItem of searchItems) {
-            if (saved + batch.length >= targetResults) break;
-            const upc = String(searchItem.upc || '').trim();
-            if (!newUpcSet.has(upc)) continue;
-            batch.push(mapSearchProduct(searchItem, sourceUrl, effectiveLocationId, listingMetadata));
-        }
-
-        if (batch.length) {
-            await Actor.pushData(batch);
-            saved += batch.length;
-            log.info(`Saved ${batch.length} products | total=${saved}/${targetResults} | page=${pageNumber}`);
-        }
-
-        const totalCount = Number(searchMetadata.totalCount || 0);
-        const noMorePages = !searchItems.length || (totalCount > 0 && offset + SEARCH_PAGE_SIZE >= totalCount);
-        if (noMorePages) {
-            stopReason = 'source exhausted';
-            break;
-        }
-        if (!batch.length && pageNumber === targetPages) stopReason = 'page limit reached';
-    }
-
-    if (saved >= targetResults) stopReason = 'result limit reached';
-    else if (pagesProcessed >= targetPages) stopReason = 'page limit reached';
-    log.info(`Finished | saved=${saved} | pages=${pagesProcessed} | stop_reason=${stopReason}`);
+    return undefined;
 }
 
 let actorError;
@@ -688,8 +871,6 @@ try {
 } catch (error) {
     actorError = error;
     log.error(`Actor failed: ${error.message}`);
-} finally {
-    await browserSession?.close();
 }
 
 if (actorError) {
